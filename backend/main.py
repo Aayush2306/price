@@ -106,10 +106,10 @@ STOCK_MAP = {
 CG_API_KEY = os.environ['CG_API_KEY']
 
 
-# DB Pool
+# DB Pool with connection health check
 pool = ThreadedConnectionPool(
     1,
-    80,
+    20,  # Reduced for Railway limits
     os.environ['DATABASE_URL'],
     cursor_factory=psycopg2.extras.RealDictCursor
 )
@@ -118,6 +118,18 @@ pool = ThreadedConnectionPool(
 def get_db_cursor(real_dict=False):
     conn = pool.getconn()
     try:
+        # Test connection health before using
+        conn.isolation_level
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor if real_dict else None)
+        yield cursor, conn
+        conn.commit()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        # Connection is dead, remove it from pool and get a new one
+        try:
+            pool.putconn(conn, close=True)
+        except:
+            pass
+        conn = pool.getconn()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor if real_dict else None)
         yield cursor, conn
         conn.commit()
@@ -1993,12 +2005,32 @@ def handle_user_leave(data):
         print(f"?? User left {room}")
 
 
-if __name__ == "__main__":
+# Initialize database and start background threads
+# This runs when the module is loaded (works with both direct run and Gunicorn)
+def startup():
+    print("🚀 Starting PredictGram backend...")
     init_db()
+    print("✅ Database initialized")
+
+    print("🔄 Starting background workers...")
     threading.Thread(target=run_rounds_forever, daemon=True).start()
+    print("  ✅ Crypto rounds worker started")
+
     threading.Thread(target=schedule_stock_tasks, daemon=True).start()
+    print("  ✅ Stock rounds worker started")
+
     threading.Thread(target=run_onchain_rounds, daemon=True).start()
+    print("  ✅ OnChain rounds worker started")
+
     threading.Thread(target=run_custom_bet_resolver, daemon=True).start()
+    print("  ✅ Custom bet resolver worker started")
+
+    print("🎉 All workers running!")
+
+# Run startup when module is loaded
+startup()
+
+if __name__ == "__main__":
     debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
     socketio.run(app, host="0.0.0.0", port=8080, debug=debug_mode)
 
