@@ -47,7 +47,7 @@ app = Flask(__name__)
 
 # CORS configuration - use environment variable for production
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
-socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS)
+socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS,cors_credentials=True)
 
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 redis_url = os.environ.get('REDIS_URL')
