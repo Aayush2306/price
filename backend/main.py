@@ -43,6 +43,43 @@ from validation import (
     validate_onchain_category
 )
 
+# ===== WEBHOOK CONFIGURATION =====
+WEBHOOK_URLS = {
+    "bet_result": os.environ.get("WEBHOOK_BET_RESULT", ""),
+    "round_resolved": os.environ.get("WEBHOOK_ROUND_RESOLVED", ""),
+    "custom_bet_resolved": os.environ.get("WEBHOOK_CUSTOM_BET_RESOLVED", ""),
+    "onchain_resolved": os.environ.get("WEBHOOK_ONCHAIN_RESOLVED", ""),
+}
+
+def send_webhook(event_type, payload):
+    """Send webhook notification for events"""
+    url = WEBHOOK_URLS.get(event_type, "")
+    if not url:
+        return  # No webhook configured for this event
+    
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "X-Webhook-Event": event_type,
+            "X-Webhook-Timestamp": str(int(time.time()))
+        }
+        # Add secret header if configured
+        webhook_secret = os.environ.get("WEBHOOK_SECRET", "")
+        if webhook_secret:
+            import hashlib
+            import hmac
+            signature = hmac.new(
+                webhook_secret.encode(),
+                json.dumps(payload, sort_keys=True).encode(),
+                hashlib.sha256
+            ).hexdigest()
+            headers["X-Webhook-Signature"] = signature
+        
+        response = requests.post(url, json=payload, headers=headers, timeout=5)
+        print(f"[WEBHOOK] {event_type}: sent to {url[:30]}... - Status: {response.status_code}")
+    except Exception as e:
+        print(f"[WEBHOOK] Error sending {event_type}: {e}")
+
 app = Flask(__name__)
 
 # CORS configuration - use environment variable for production
@@ -64,12 +101,14 @@ if redis_url and not redis_disabled:
 else:
     app.config['SESSION_TYPE'] = 'filesystem'
 app.config['SESSION_COOKIE_NAME'] = 'bet_session'
-app.config['SESSION_PERMANENT'] = False
+app.config['SESSION_PERMANENT'] = True  # Allow permanent sessions
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)  # 7 days session lifetime
 app.config['SESSION_USE_SIGNER'] = True
 app.config['SESSION_KEY_PREFIX'] = 'sess:'
 app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_REFRESH_EACH_REQUEST'] = True  # Refresh session on each request
 
 
 
@@ -410,10 +449,21 @@ def phantom_nonce():
         return jsonify({"error": "Missing wallet_address"}), 400
 
     nonce = uuid.uuid4().hex
+    
+    # Clear any existing session data first to prevent stale data
+    session.clear()
+    
+    # Make session permanent with longer lifetime for nonce phase
+    session.permanent = True
     session["phantom_nonce"] = nonce
     session["phantom_wallet"] = wallet_address
+    session["nonce_created_at"] = int(time.time())
+    
+    # Force session to be saved
+    session.modified = True
 
     message = f"On-Chain Market login\nWallet: {wallet_address}\nNonce: {nonce}"
+    print(f"[AUTH] Generated nonce for wallet {wallet_address[:8]}...{wallet_address[-4:]}")
     return jsonify({"message": message})
 
 
@@ -427,11 +477,25 @@ def phantom_verify():
 
     session_wallet = session.get("phantom_wallet")
     nonce = session.get("phantom_nonce")
+    nonce_created_at = session.get("nonce_created_at", 0)
 
     if not wallet_address or not signature_b64:
+        print(f"[AUTH] Verify failed: Missing wallet_address or signature")
         return jsonify({"error": "Missing wallet_address or signature"}), 400
-    if not nonce or session_wallet != wallet_address:
-        return jsonify({"error": "No active login session"}), 400
+    
+    # Check if nonce expired (5 minute timeout)
+    if nonce_created_at and (int(time.time()) - nonce_created_at) > 300:
+        print(f"[AUTH] Verify failed: Nonce expired for wallet {wallet_address[:8]}...{wallet_address[-4:]}")
+        session.clear()
+        return jsonify({"error": "Login session expired. Please try again."}), 400
+    
+    if not nonce:
+        print(f"[AUTH] Verify failed: No nonce in session for wallet {wallet_address[:8]}...{wallet_address[-4:]}. Session keys: {list(session.keys())}")
+        return jsonify({"error": "No active login session. Please reconnect your wallet."}), 400
+    
+    if session_wallet != wallet_address:
+        print(f"[AUTH] Verify failed: Wallet mismatch. Session: {session_wallet}, Request: {wallet_address}")
+        return jsonify({"error": "Wallet address mismatch. Please reconnect your wallet."}), 400
 
     message = f"On-Chain Market login\nWallet: {wallet_address}\nNonce: {nonce}"
     try:
@@ -1171,6 +1235,41 @@ def place_custom_bet():
         )
 
         conn.commit()
+        
+        # Get updated pool totals for socket emit
+        cursor.execute(
+            """
+            SELECT total_pool,
+                   SUM(CASE WHEN cb.prediction = 'higher' THEN cb.amount ELSE 0 END) as higher_pool,
+                   SUM(CASE WHEN cb.prediction = 'lower' THEN cb.amount ELSE 0 END) as lower_pool,
+                   COUNT(cb.id) as bet_count
+            FROM custom_bet_rounds cbr
+            LEFT JOIN custom_bets cb ON cbr.id = cb.round_id
+            WHERE cbr.id = %s
+            GROUP BY cbr.id
+            """, (round_id,)
+        )
+        pool_data = cursor.fetchone()
+        
+        # Emit custom bet update to room
+        room = f"custom-bet-{round_id}"
+        socketio.emit("custom_bet_update", {
+            "round_id": round_id,
+            "total_pool": pool_data['total_pool'] if pool_data else amount,
+            "higher_pool": pool_data['higher_pool'] if pool_data else 0,
+            "lower_pool": pool_data['lower_pool'] if pool_data else 0,
+            "bet_count": pool_data['bet_count'] if pool_data else 1,
+            "new_bet": {
+                "prediction": prediction,
+                "amount": amount
+            }
+        }, room=room)
+        
+        # Also emit credits update to user
+        socketio.emit("credits_update", {
+            "user_id": user_id,
+            "change": -amount
+        }, room=f"user-{user_id}")
 
     return jsonify({"message": "Bet placed successfully"})
 
@@ -1497,6 +1596,17 @@ def resolve_round(round_id, result):
         # Commit all database changes
         conn.commit()
         print(f"  [BETS] Resolved {len(all_bets)} bets for round #{round_id}")
+        
+        # Send webhook for round resolution
+        send_webhook("round_resolved", {
+            "event": "round_resolved",
+            "round_id": round_id,
+            "crypto": round_info["crypto"],
+            "end_price": round_info["end_price"],
+            "result": result,
+            "total_bets": len(all_bets),
+            "timestamp": int(time.time())
+        })
 
 
 def manage_round_for_symbol(symbol, price_data):
@@ -1763,24 +1873,68 @@ def resolve_onchain_bets(round_id, result):
 
         conn.commit()
         print(f"[ONCHAIN] Resolved {len(all_bets)} bets for round #{round_id}")
+        
+        # Send webhook for on-chain round resolution
+        cursor.execute("SELECT category FROM onchain_rounds WHERE id = %s", (round_id,))
+        round_info = cursor.fetchone()
+        send_webhook("onchain_resolved", {
+            "event": "onchain_resolved",
+            "round_id": round_id,
+            "category": round_info["category"] if round_info else "unknown",
+            "result": result,
+            "total_bets": len(all_bets),
+            "timestamp": int(time.time())
+        })
 
 
 def run_onchain_rounds():
-    """Create and resolve on-chain prediction rounds daily"""
+    """Create and resolve on-chain prediction rounds - checks every loop for missing rounds"""
     from dune_client import PREDICTION_CATEGORIES
+
+    last_round_check = 0  # Track last time we checked for missing rounds (every 5 minutes)
+    ROUND_CHECK_INTERVAL = 300  # Check for missing rounds every 5 minutes
+
+    # Check on startup if rounds exist
+    try:
+        with get_db_cursor() as (cursor, _):
+            cursor.execute(
+                "SELECT COUNT(*) as count FROM onchain_rounds WHERE result IS NULL"
+            )
+            result = cursor.fetchone()
+            active_count = result['count'] if result else 0
+
+        if active_count == 0:
+            print("[ONCHAIN] No active rounds found on startup, creating initial rounds...")
+            for category in PREDICTION_CATEGORIES.keys():
+                create_onchain_round(category)
+            last_round_check = int(time.time())
+    except Exception as e:
+        print(f"[ONCHAIN] Error checking for active rounds on startup: {e}")
 
     while True:
         try:
-            now = datetime.utcnow()
+            now_ts = int(time.time())
 
-            # Create new rounds at midnight UTC
-            if now.hour == 0 and now.minute == 0:
-                print("[ONCHAIN] Creating new daily rounds...")
-                for category in PREDICTION_CATEGORIES.keys():
-                    create_onchain_round(category)
+            # Check every 5 minutes if we need to create rounds for any category
+            if now_ts - last_round_check >= ROUND_CHECK_INTERVAL:
+                last_round_check = now_ts
 
-                # Wait a minute to avoid duplicate creation
-                time.sleep(60)
+                # Check if any active rounds exist for each category
+                with get_db_cursor() as (cursor, _):
+                    for category in PREDICTION_CATEGORIES.keys():
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*) as count FROM onchain_rounds
+                            WHERE category = %s AND result IS NULL
+                            """,
+                            (category,)
+                        )
+                        result = cursor.fetchone()
+                        active_count = result['count'] if result else 0
+
+                        if active_count == 0:
+                            print(f"[ONCHAIN] No active round for {category}, creating new round...")
+                            create_onchain_round(category)
 
             # Check for rounds to resolve
             with get_db_cursor() as (cursor, _):
@@ -1894,7 +2048,14 @@ def resolve_custom_bet_round(round_id):
                         "UPDATE custom_bet_rounds SET creator_earnings = %s WHERE id = %s",
                         (total_pool, round_id)
                     )
-                    print(f"[CUSTOM BET] No winners - Creator gets full pool: {total_pool}")
+                    # Mark all bets as lost when no winners
+                    for bet in all_bets:
+                        loss = -bet['amount']
+                        cursor.execute(
+                            "UPDATE custom_bets SET status = 'lost', profit = %s WHERE id = %s",
+                            (loss, bet['id'])
+                        )
+                    print(f"[CUSTOM BET] No winners - Creator gets full pool: {total_pool}, marked {len(all_bets)} bets as lost")
                 else:
                     # Pay creator fee
                     cursor.execute(
@@ -1935,6 +2096,55 @@ def resolve_custom_bet_round(round_id):
                     print(f"[CUSTOM BET] Resolved: {len(winners)} winners, {len(losers)} losers, Creator fee: {creator_fee}")
 
             conn.commit()
+            
+            # Calculate winners/losers counts for socket emit
+            if result == "same":
+                winners_count = 0
+                losers_count = 0
+            else:
+                winners_count = len(winners)
+                losers_count = len(losers)
+            
+            # Emit custom_bet_resolved socket event
+            room = f"custom-bet-{round_id}"
+            socketio.emit("custom_bet_resolved", {
+                "round_id": round_id,
+                "token_symbol": round_data['token_symbol'],
+                "token_ca": round_data['token_ca'],
+                "start_price": start_price,
+                "end_price": end_price,
+                "result": result,
+                "total_pool": total_pool,
+                "winners_count": winners_count,
+                "losers_count": losers_count
+            }, room=room)
+            
+            # Also emit bet_result to each user who placed a bet
+            for bet in all_bets:
+                status = "refunded" if result == "same" else ("won" if bet['prediction'] == result else "lost")
+                socketio.emit("bet_result", {
+                    "type": "custom_bet",
+                    "round_id": round_id,
+                    "token_symbol": round_data['token_symbol'],
+                    "status": status,
+                    "amount": bet['amount'],
+                    "profit": bet.get('profit', 0)
+                }, room=f"user-{bet['user_id']}")
+            
+            # Send webhook for custom bet resolution
+            send_webhook("custom_bet_resolved", {
+                "event": "custom_bet_resolved",
+                "round_id": round_id,
+                "token_symbol": round_data['token_symbol'],
+                "token_ca": round_data['token_ca'],
+                "start_price": start_price,
+                "end_price": end_price,
+                "result": result,
+                "total_pool": total_pool,
+                "total_bets": len(all_bets),
+                "creator_id": round_data['creator_id'],
+                "timestamp": int(time.time())
+            })
 
     except Exception as e:
         print(f"[CUSTOM BET] Error resolving round #{round_id}: {e}")
@@ -2002,7 +2212,25 @@ def handle_user_leave(data):
     if user_id:
         room = f"user-{user_id}"
         leave_room(room)
-        print(f"?? User left {room}")
+        print(f"👋 User left {room}")
+
+
+@socketio.on("join_custom_bet")
+def handle_custom_bet_join(data):
+    round_id = data.get("round_id")
+    if round_id:
+        room = f"custom-bet-{round_id}"
+        join_room(room)
+        print(f"🎯 User joined {room}")
+
+
+@socketio.on("leave_custom_bet")
+def handle_custom_bet_leave(data):
+    round_id = data.get("round_id")
+    if round_id:
+        room = f"custom-bet-{round_id}"
+        leave_room(room)
+        print(f"👋 User left {room}")
 
 
 # Initialize database and start background threads
