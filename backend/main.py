@@ -33,8 +33,6 @@ import base58
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 import json
-import jwt
-from functools import wraps
 from validation import (
     validate_bet_amount,
     validate_direction,
@@ -115,60 +113,9 @@ app.config['SESSION_REFRESH_EACH_REQUEST'] = True  # Refresh session on each req
 
 
 app.config['SECRET_KEY'] = os.environ['SECRET_KEY']  # You can change this
-JWT_SECRET = os.environ.get('JWT_SECRET', os.environ['SECRET_KEY'])
-JWT_EXPIRY_HOURS = 24 * 7  # 7 days
 
 Session(app)
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=True)
-
-# ===== JWT HELPER FUNCTIONS =====
-def create_jwt_token(user_id, username=None, name=None):
-    """Create a JWT token for the user"""
-    payload = {
-        "user_id": user_id,
-        "username": username,
-        "name": name,
-        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS),
-        "iat": datetime.utcnow()
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-def decode_jwt_token(token):
-    """Decode and validate a JWT token"""
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
-        return None
-
-def get_current_user():
-    """Get current user from JWT token or session"""
-    # Try JWT token first (Authorization header)
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-        payload = decode_jwt_token(token)
-        if payload:
-            return {"user_id": payload.get("user_id"), "username": payload.get("username"), "name": payload.get("name")}
-    
-    # Fall back to session (for browsers that support cookies)
-    if 'user' in session:
-        return session['user']
-    
-    return None
-
-def jwt_or_session_required(f):
-    """Decorator to require JWT token or valid session"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        user = get_current_user()
-        if not user:
-            return jsonify({"error": "Authentication required"}), 401
-        request.current_user = user
-        return f(*args, **kwargs)
-    return decorated_function
 
 # Symbol to CoinGecko ID mapping
 CRYPTO_MAP = {
@@ -367,15 +314,6 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS custom_bet_rounds_status_idx ON custom_bet_rounds (status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS custom_bet_rounds_token_ca_idx ON custom_bet_rounds (token_ca, status)")
 
-        # Auth nonces table (for Safari/iPhone compatibility - stores nonces in DB instead of session)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS auth_nonces (
-                wallet_address TEXT PRIMARY KEY,
-                nonce TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-        ''')
-
         conn.commit()
         cursor.close()
     finally:
@@ -478,13 +416,12 @@ def reset_users_table():
 def create_or_get_user():
     with get_db_cursor() as (cursor, conn):
 
-        # 🔹 GET = return user info (supports JWT and session auth)
+        # 🔹 GET = return session-based user info (used after login or refresh)
         if request.method == "GET":
-            current_user = get_current_user()
-            if not current_user:
+            if 'user' not in session:
                 return jsonify({"error": "Not logged in"}), 401
 
-            user_id = current_user['user_id']
+            user_id = session['user']['user_id']
             cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
             user = cursor.fetchone()
             return jsonify(user)
@@ -532,25 +469,17 @@ def phantom_nonce():
         return jsonify({"error": "Missing wallet_address"}), 400
 
     nonce = uuid.uuid4().hex
-    created_at = int(time.time())
     
-    # Store nonce in database (works across all browsers including Safari)
-    with get_db_cursor() as (cursor, conn):
-        # Delete any existing nonce for this wallet
-        cursor.execute("DELETE FROM auth_nonces WHERE wallet_address = %s", (wallet_address,))
-        # Insert new nonce
-        cursor.execute(
-            "INSERT INTO auth_nonces (wallet_address, nonce, created_at) VALUES (%s, %s, %s)",
-            (wallet_address, nonce, created_at)
-        )
-        conn.commit()
-    
-    # Also store in session as fallback for browsers that support cookies
+    # Clear any existing session data first to prevent stale data
     session.clear()
+    
+    # Make session permanent with longer lifetime for nonce phase
     session.permanent = True
     session["phantom_nonce"] = nonce
     session["phantom_wallet"] = wallet_address
-    session["nonce_created_at"] = created_at
+    session["nonce_created_at"] = int(time.time())
+    
+    # Force session to be saved
     session.modified = True
 
     message = f"On-Chain Market login\nWallet: {wallet_address}\nNonce: {nonce}"
@@ -566,38 +495,13 @@ def phantom_verify():
     name = data.get("name")
     username = data.get("username")
 
+    session_wallet = session.get("phantom_wallet")
+    nonce = session.get("phantom_nonce")
+    nonce_created_at = session.get("nonce_created_at", 0)
+
     if not wallet_address or not signature_b64:
         print(f"[AUTH] Verify failed: Missing wallet_address or signature")
         return jsonify({"error": "Missing wallet_address or signature"}), 400
-
-    # Try to get nonce from database first (works on Safari), then fall back to session
-    nonce = None
-    nonce_created_at = 0
-    
-    with get_db_cursor() as (cursor, conn):
-        cursor.execute(
-            "SELECT nonce, created_at FROM auth_nonces WHERE wallet_address = %s",
-            (wallet_address,)
-        )
-        nonce_row = cursor.fetchone()
-        
-        if nonce_row:
-            nonce = nonce_row["nonce"]
-            nonce_created_at = nonce_row["created_at"]
-            # Delete the nonce (one-time use)
-            cursor.execute("DELETE FROM auth_nonces WHERE wallet_address = %s", (wallet_address,))
-            conn.commit()
-            print(f"[AUTH] Got nonce from database for wallet {wallet_address[:8]}...{wallet_address[-4:]}")
-    
-    # Fall back to session if database nonce not found
-    if not nonce:
-        nonce = session.get("phantom_nonce")
-        nonce_created_at = session.get("nonce_created_at", 0)
-        session_wallet = session.get("phantom_wallet")
-        
-        if session_wallet and session_wallet != wallet_address:
-            print(f"[AUTH] Verify failed: Wallet mismatch. Session: {session_wallet}, Request: {wallet_address}")
-            return jsonify({"error": "Wallet address mismatch. Please reconnect your wallet."}), 400
     
     # Check if nonce expired (5 minute timeout)
     if nonce_created_at and (int(time.time()) - nonce_created_at) > 300:
@@ -606,8 +510,12 @@ def phantom_verify():
         return jsonify({"error": "Login session expired. Please try again."}), 400
     
     if not nonce:
-        print(f"[AUTH] Verify failed: No nonce found for wallet {wallet_address[:8]}...{wallet_address[-4:]}. Session keys: {list(session.keys())}")
+        print(f"[AUTH] Verify failed: No nonce in session for wallet {wallet_address[:8]}...{wallet_address[-4:]}. Session keys: {list(session.keys())}")
         return jsonify({"error": "No active login session. Please reconnect your wallet."}), 400
+    
+    if session_wallet != wallet_address:
+        print(f"[AUTH] Verify failed: Wallet mismatch. Session: {session_wallet}, Request: {wallet_address}")
+        return jsonify({"error": "Wallet address mismatch. Please reconnect your wallet."}), 400
 
     message = f"On-Chain Market login\nWallet: {wallet_address}\nNonce: {nonce}"
     try:
@@ -644,10 +552,6 @@ def phantom_verify():
                 (wallet_address,))
             user = cursor.fetchone()
 
-    # Create JWT token for the user (works on Safari and all browsers)
-    token = create_jwt_token(user["id"], user.get("username"), user.get("name"))
-
-    # Also set session for browsers that support cookies
     session['user'] = {
         "user_id": user["id"],
         "name": user["name"],
@@ -658,27 +562,15 @@ def phantom_verify():
     session.pop("phantom_nonce", None)
     session.pop("phantom_wallet", None)
 
-    # Return user data along with JWT token
-    response_data = {
-        "id": user["id"],
-        "name": user["name"],
-        "username": user["username"],
-        "joined_at": str(user["joined_at"]) if user.get("joined_at") else None,
-        "credits": user.get("credits", 1000),
-        "token": token  # JWT token for Safari/mobile
-    }
-    print(f"[AUTH] User logged in: {wallet_address[:8]}...{wallet_address[-4:]} (JWT token issued)")
-    return jsonify(response_data)
+    return jsonify(user)
 
 
 @app.route("/api/profile")
 def get_profile():
-    # Try JWT token or session
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
 
     with get_db_cursor() as (cursor, conn):
         cursor.execute(
@@ -699,11 +591,10 @@ def get_profile():
 @app.route("/api/bet", methods=["POST"])
 def place_bet():
     data = request.json
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
     round_id = data.get("round_id")
     crypto = data.get("crypto", "").upper()
     direction = data.get("direction")
@@ -848,11 +739,10 @@ def get_current_round():
 
 @app.route("/api/my-stats", methods=["GET"])
 def get_my_stats():
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
 
     with get_db_cursor() as (cursor, _):
         cursor.execute(
@@ -952,11 +842,10 @@ def get_round_result():
 
 @app.route("/api/user-bets", methods=["GET"])
 def get_user_bets():
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
     round_id = request.args.get("round_id")
     if not round_id:
         return jsonify({"error": "Missing round_id"}), 400
@@ -969,11 +858,10 @@ def get_user_bets():
 
 @app.route("/api/user-bets-history", methods=["GET"])
 def user_bets_history():
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
     with get_db_cursor() as (cursor, _):
         cursor.execute(
             '''
@@ -989,11 +877,10 @@ def user_bets_history():
 
 @app.route("/api/notifications", methods=["GET"])
 def get_notifications():
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
     all_notifications = []
 
     with get_db_cursor() as (cursor, _):
@@ -1135,11 +1022,10 @@ def get_onchain_rounds():
 def place_onchain_bet():
     """Place a bet on an on-chain prediction"""
     data = request.json
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
     round_id = data.get("round_id")
     category = data.get("category")
     prediction = data.get("prediction")  # "higher" or "lower"
@@ -1206,11 +1092,10 @@ def place_onchain_bet():
 @app.route("/api/onchain/user-bets", methods=["GET"])
 def get_user_onchain_bets():
     """Get user's on-chain bet history"""
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
 
     with get_db_cursor() as (cursor, _):
         cursor.execute(
@@ -1232,12 +1117,11 @@ def get_user_onchain_bets():
 @app.route("/api/custom-bet/create", methods=["POST"])
 def create_custom_bet():
     """Create a new custom bet round"""
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.json
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
     token_ca = data.get("token_ca", "").strip()
     duration = data.get("duration")
 
@@ -1352,12 +1236,11 @@ def get_custom_bet_details(round_id):
 @app.route("/api/custom-bet/place", methods=["POST"])
 def place_custom_bet():
     """Place a bet on a custom round"""
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.json
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
     round_id = data.get("round_id")
     prediction = data.get("prediction")
     amount = data.get("amount")
@@ -1456,11 +1339,10 @@ def place_custom_bet():
 @app.route("/api/custom-bet/user-bets", methods=["GET"])
 def get_user_custom_bets():
     """Get user's custom bet history"""
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
 
     with get_db_cursor() as (cursor, _):
         cursor.execute(
@@ -1481,11 +1363,10 @@ def get_user_custom_bets():
 @app.route("/api/custom-bet/creator-earnings", methods=["GET"])
 def get_creator_earnings():
     """Get user's earnings as a bet creator"""
-    current_user = get_current_user()
-    if not current_user:
+    if 'user' not in session:
         return jsonify({"error": "Not logged in"}), 401
 
-    user_id = current_user['user_id']
+    user_id = session['user']['user_id']
 
     with get_db_cursor() as (cursor, _):
         cursor.execute(
