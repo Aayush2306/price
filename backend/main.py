@@ -67,8 +67,8 @@ app.config['SESSION_COOKIE_NAME'] = 'bet_session'
 app.config['SESSION_PERMANENT'] = False
 app.config['SESSION_USE_SIGNER'] = True
 app.config['SESSION_KEY_PREFIX'] = 'sess:'
-app.config['SESSION_COOKIE_SAMESITE'] = None
-app.config['SESSION_COOKIE_SECURE'] = 1
+app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 
 
