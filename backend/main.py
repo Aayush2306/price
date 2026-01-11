@@ -155,28 +155,36 @@ pool = ThreadedConnectionPool(
 
 @contextmanager
 def get_db_cursor(real_dict=False):
-    conn = pool.getconn()
+    conn = None
     try:
-        # Test connection health before using
-        conn.isolation_level
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor if real_dict else None)
-        yield cursor, conn
-        conn.commit()
-    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
-        # Connection is dead, remove it from pool and get a new one
-        try:
-            pool.putconn(conn, close=True)
-        except:
-            pass
         conn = pool.getconn()
+        # Test connection health before using
+        try:
+            conn.isolation_level
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # Connection is dead, close it and get a new one
+            try:
+                pool.putconn(conn, close=True)
+            except:
+                pass
+            conn = pool.getconn()
+        
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor if real_dict else None)
         yield cursor, conn
         conn.commit()
     except Exception as e:
-        conn.rollback()
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
         raise e
     finally:
-        pool.putconn(conn)
+        if conn:
+            try:
+                pool.putconn(conn)
+            except:
+                pass
 
 
 
@@ -212,181 +220,193 @@ def ensure_user_schema():
 
 def init_db():
     ensure_user_schema()
-    conn = get_conn()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS rounds (
-            id SERIAL PRIMARY KEY,
-            crypto TEXT,
-            start_price REAL,
-            end_price REAL,
-            start_time INTEGER,
-            end_time INTEGER,
-            result TEXT DEFAULT NULL
-        );
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bets (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            round_id INTEGER,
-            crypto TEXT,
-            direction TEXT,
-            amount INTEGER,
-            status TEXT DEFAULT 'pending'
-        );
-    ''')
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS bets_user_round_idx ON bets (user_id, round_id)")
+    conn = None
+    try:
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rounds (
+                id SERIAL PRIMARY KEY,
+                crypto TEXT,
+                start_price REAL,
+                end_price REAL,
+                start_time INTEGER,
+                end_time INTEGER,
+                result TEXT DEFAULT NULL
+            );
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bets (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT,
+                round_id INTEGER,
+                crypto TEXT,
+                direction TEXT,
+                amount INTEGER,
+                status TEXT DEFAULT 'pending'
+            );
+        ''')
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS bets_user_round_idx ON bets (user_id, round_id)")
 
-    # On-chain prediction tables
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS onchain_rounds (
-            id SERIAL PRIMARY KEY,
-            category TEXT,
-            start_value REAL,
-            end_value REAL,
-            reference_value REAL,
-            start_time INTEGER,
-            end_time INTEGER,
-            result TEXT DEFAULT NULL,
-            metadata JSONB
-        );
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS onchain_bets (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            round_id INTEGER,
-            category TEXT,
-            prediction TEXT,
-            amount INTEGER,
-            status TEXT DEFAULT 'pending',
-            profit INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    ''')
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS onchain_bets_user_round_idx ON onchain_bets (user_id, round_id)")
+        # On-chain prediction tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS onchain_rounds (
+                id SERIAL PRIMARY KEY,
+                category TEXT,
+                start_value REAL,
+                end_value REAL,
+                reference_value REAL,
+                start_time INTEGER,
+                end_time INTEGER,
+                result TEXT DEFAULT NULL,
+                metadata JSONB
+            );
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS onchain_bets (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT,
+                round_id INTEGER,
+                category TEXT,
+                prediction TEXT,
+                amount INTEGER,
+                status TEXT DEFAULT 'pending',
+                profit INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        ''')
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS onchain_bets_user_round_idx ON onchain_bets (user_id, round_id)")
 
-    # Custom bet tables
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS custom_bet_rounds (
-            id SERIAL PRIMARY KEY,
-            creator_id TEXT NOT NULL,
-            token_ca TEXT NOT NULL,
-            token_name TEXT,
-            token_symbol TEXT,
-            start_price REAL,
-            end_price REAL,
-            start_mcap REAL,
-            duration_minutes INTEGER,
-            start_time INTEGER,
-            end_time INTEGER,
-            result TEXT DEFAULT NULL,
-            total_pool INTEGER DEFAULT 0,
-            creator_earnings INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'active',
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS custom_bets (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            round_id INTEGER NOT NULL,
-            prediction TEXT NOT NULL,
-            amount INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',
-            profit INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    ''')
-    cursor.execute("CREATE INDEX IF NOT EXISTS custom_bets_round_idx ON custom_bets (round_id)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS custom_bet_rounds_status_idx ON custom_bet_rounds (status)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS custom_bet_rounds_token_ca_idx ON custom_bet_rounds (token_ca, status)")
+        # Custom bet tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS custom_bet_rounds (
+                id SERIAL PRIMARY KEY,
+                creator_id TEXT NOT NULL,
+                token_ca TEXT NOT NULL,
+                token_name TEXT,
+                token_symbol TEXT,
+                start_price REAL,
+                end_price REAL,
+                start_mcap REAL,
+                duration_minutes INTEGER,
+                start_time INTEGER,
+                end_time INTEGER,
+                result TEXT DEFAULT NULL,
+                total_pool INTEGER DEFAULT 0,
+                creator_earnings INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS custom_bets (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                round_id INTEGER NOT NULL,
+                prediction TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                profit INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS custom_bets_round_idx ON custom_bets (round_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS custom_bet_rounds_status_idx ON custom_bet_rounds (status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS custom_bet_rounds_token_ca_idx ON custom_bet_rounds (token_ca, status)")
 
-    conn.commit()
-    cursor.close()
-    release_conn(conn)
+        conn.commit()
+        cursor.close()
+    finally:
+        if conn:
+            release_conn(conn)
 
 
 def reset_and_init_db():
-    conn = get_conn()
-    cursor = conn.cursor()
+    conn = None
+    try:
+        conn = get_conn()
+        cursor = conn.cursor()
 
-    # 🚨 WARNING: This will delete all user, round, and bet data!
-    cursor.execute("DROP TABLE IF EXISTS bets")
-    cursor.execute("DROP TABLE IF EXISTS rounds")
-    cursor.execute("DROP TABLE IF EXISTS users")
+        # 🚨 WARNING: This will delete all user, round, and bet data!
+        cursor.execute("DROP TABLE IF EXISTS bets")
+        cursor.execute("DROP TABLE IF EXISTS rounds")
+        cursor.execute("DROP TABLE IF EXISTS users")
 
-    # 👤 Users table with extra fields
-    cursor.execute("""
-        CREATE TABLE users (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            username TEXT UNIQUE,
-            joined_at TIMESTAMP DEFAULT NOW(),
-            credits INTEGER DEFAULT 1000
-        );
-    """)
-    cursor.execute("CREATE UNIQUE INDEX users_username_lower_idx ON users (LOWER(username))")
+        # 👤 Users table with extra fields
+        cursor.execute("""
+            CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                username TEXT UNIQUE,
+                joined_at TIMESTAMP DEFAULT NOW(),
+                credits INTEGER DEFAULT 1000
+            );
+        """)
+        cursor.execute("CREATE UNIQUE INDEX users_username_lower_idx ON users (LOWER(username))")
 
-    # 🔁 Rounds table
-    cursor.execute("""
-        CREATE TABLE rounds (
-            id SERIAL PRIMARY KEY,
-            crypto TEXT,
-            start_price REAL,
-            end_price REAL,
-            start_time INTEGER,
-            end_time INTEGER,
-            result TEXT DEFAULT NULL
-        );
-    """)
+        # 🔁 Rounds table
+        cursor.execute("""
+            CREATE TABLE rounds (
+                id SERIAL PRIMARY KEY,
+                crypto TEXT,
+                start_price REAL,
+                end_price REAL,
+                start_time INTEGER,
+                end_time INTEGER,
+                result TEXT DEFAULT NULL
+            );
+        """)
 
-    # 💰 Bets table with created_at and profit field
-    cursor.execute("""
-        CREATE TABLE bets (
-            id SERIAL PRIMARY KEY,
-            user_id TEXT,
-            round_id INTEGER,
-            crypto TEXT,
-            direction TEXT,
-            amount INTEGER,
-            status TEXT DEFAULT 'pending',
-            profit INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-    """)
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS bets_user_round_idx ON bets (user_id, round_id)")
+        # 💰 Bets table with created_at and profit field
+        cursor.execute("""
+            CREATE TABLE bets (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT,
+                round_id INTEGER,
+                crypto TEXT,
+                direction TEXT,
+                amount INTEGER,
+                status TEXT DEFAULT 'pending',
+                profit INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS bets_user_round_idx ON bets (user_id, round_id)")
 
-    conn.commit()
-    cursor.close()
-    release_conn(conn)
-    print("✅ Database reset and initialized with updated schema.")
+        conn.commit()
+        cursor.close()
+        print("✅ Database reset and initialized with updated schema.")
+    finally:
+        if conn:
+            release_conn(conn)
 
 
 def reset_users_table():
-    conn = get_conn()
-    cursor = conn.cursor()
+    conn = None
+    try:
+        conn = get_conn()
+        cursor = conn.cursor()
 
-    # Drop old table if exists
-    cursor.execute("DROP TABLE IF EXISTS users")
+        # Drop old table if exists
+        cursor.execute("DROP TABLE IF EXISTS users")
 
-    # Recreate with new schema
-    cursor.execute("""
-        CREATE TABLE users (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            username TEXT UNIQUE,
-            joined_at TIMESTAMP DEFAULT NOW(),
-            credits INTEGER DEFAULT 1000
-        )
-    """)
-    cursor.execute("CREATE UNIQUE INDEX users_username_lower_idx ON users (LOWER(username))")
-    conn.commit()
-    cursor.close()
-    release_conn(conn)
-    print("✅ users table reset successfully.")
+        # Recreate with new schema
+        cursor.execute("""
+            CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                username TEXT UNIQUE,
+                joined_at TIMESTAMP DEFAULT NOW(),
+                credits INTEGER DEFAULT 1000
+            )
+        """)
+        cursor.execute("CREATE UNIQUE INDEX users_username_lower_idx ON users (LOWER(username))")
+        conn.commit()
+        cursor.close()
+        print("✅ users table reset successfully.")
+    finally:
+        if conn:
+            release_conn(conn)
 
 
 
@@ -1452,8 +1472,12 @@ def schedule_stock_tasks():
     schedule.every().day.at("21:00").do(run_stock_close_resolution)
 
     while True:
-        schedule.run_pending()
-        time.sleep(1)
+        try:
+            schedule.run_pending()
+            time.sleep(1)
+        except Exception as e:
+            print(f"[STOCK] Error in scheduler: {e}")
+            time.sleep(60)
 
 
 TWELVE_API_KEY = os.environ['TWELVE_API_KEY']
@@ -1693,87 +1717,100 @@ def run_rounds_forever():
 
     # Start immediately without alignment for instant rounds
     while True:
-        # Fetch start price once for all tokens
-        prices = get_all_prices()
-        round_start = int(time.time())
-        round_end = round_start + round_duration
+        try:
+            # Fetch start price once for all tokens
+            prices = get_all_prices()
+            if not prices:
+                print(f"[ERROR] Failed to get prices at round start! Retrying in 30s...")
+                time.sleep(30)
+                continue
+                
+            round_start = int(time.time())
+            round_end = round_start + round_duration
 
-        for symbol in CRYPTO_MAP.keys():
-            price = prices.get(symbol, {}).get("usd")
-            if not price:
+            for symbol in CRYPTO_MAP.keys():
+                price = prices.get(symbol, {}).get("usd")
+                if not price:
+                    continue
+
+                try:
+                    with get_db_cursor() as (cursor, conn):
+                        cursor.execute(
+                            "INSERT INTO rounds (crypto, start_price, start_time, end_time) VALUES (%s, %s, %s, %s) RETURNING id",
+                            (symbol, price, round_start, round_end)
+                        )
+                        round_id = cursor.fetchone()['id']
+                        conn.commit()
+
+                        room = f"{symbol}-room"
+                        socketio.emit("round_update", {
+                            "crypto": symbol,
+                            "round_id": round_id,
+                            "start_price": price,
+                            "start_time": round_start,
+                            "end_time": round_end
+                        }, room=room)
+                except Exception as e:
+                    print(f"[ERROR] Failed to create round for {symbol}: {e}")
+
+            print(f"[ROUNDS] Round started at {round_start} and will end at {round_end}")
+            time.sleep(round_duration)
+
+            # At round end, fetch current price and resolve
+            print(f"[ROUNDS] Round ended! Fetching end prices...")
+            prices = get_all_prices()
+
+            if not prices:
+                print(f"[ERROR] Failed to get prices! Skipping resolution...")
                 continue
 
-            with get_db_cursor() as (cursor, conn):
-                cursor.execute(
-                    "INSERT INTO rounds (crypto, start_price, start_time, end_time) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (symbol, price, round_start, round_end)
-                )
-                round_id = cursor.fetchone()['id']
-                conn.commit()
+            print(f"[RESOLUTION] Got prices for {len(prices)} cryptos. Resolving all rounds in parallel...")
 
-                room = f"{symbol}-room"
-                socketio.emit("round_update", {
-                    "crypto": symbol,
-                    "round_id": round_id,
-                    "start_price": price,
-                    "start_time": round_start,
-                    "end_time": round_end
-                }, room=room)
+            # Helper function to resolve a single symbol's round
+            def resolve_single_symbol(symbol):
+                try:
+                    with get_db_cursor() as (cursor, conn):
+                        cursor.execute("SELECT * FROM rounds WHERE crypto = %s ORDER BY id DESC LIMIT 1", (symbol,))
+                        round_data = cursor.fetchone()
 
-        print(f"[ROUNDS] Round started at {round_start} and will end at {round_end}")
-        time.sleep(round_duration)
+                        if not round_data or round_data["result"] is not None:
+                            return None
 
-        # At round end, fetch current price and resolve
-        print(f"[ROUNDS] Round ended! Fetching end prices...")
-        prices = get_all_prices()
+                        end_price = prices.get(symbol, {}).get("usd", round_data["start_price"])
+                        result = "same"
+                        if end_price > round_data["start_price"]:
+                            result = "up"
+                        elif end_price < round_data["start_price"]:
+                            result = "down"
 
-        if not prices:
-            print(f"[ERROR] Failed to get prices! Skipping resolution...")
-            continue
+                        cursor.execute(
+                            "UPDATE rounds SET end_price = %s, result = %s WHERE id = %s",
+                            (end_price, result, round_data["id"])
+                        )
+                        conn.commit()
 
-        print(f"[RESOLUTION] Got prices for {len(prices)} cryptos. Resolving all rounds in parallel...")
+                        print(f"  [RESOLVE] {symbol} Round #{round_data['id']}: {round_data['start_price']} -> {end_price} = {result.upper()}")
+                        resolve_round(round_data["id"], result)
+                        return symbol
+                except Exception as e:
+                    print(f"  [ERROR] Error resolving {symbol}: {e}")
+                    return None
 
-        # Helper function to resolve a single symbol's round
-        def resolve_single_symbol(symbol):
-            try:
-                with get_db_cursor() as (cursor, conn):
-                    cursor.execute("SELECT * FROM rounds WHERE crypto = %s ORDER BY id DESC LIMIT 1", (symbol,))
-                    round_data = cursor.fetchone()
+            # Resolve all rounds in parallel using ThreadPoolExecutor
+            resolved_count = 0
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {executor.submit(resolve_single_symbol, symbol): symbol for symbol in CRYPTO_MAP.keys()}
+                for future in as_completed(futures):
+                    if future.result() is not None:
+                        resolved_count += 1
 
-                    if not round_data or round_data["result"] is not None:
-                        return None
-
-                    end_price = prices.get(symbol, {}).get("usd", round_data["start_price"])
-                    result = "same"
-                    if end_price > round_data["start_price"]:
-                        result = "up"
-                    elif end_price < round_data["start_price"]:
-                        result = "down"
-
-                    cursor.execute(
-                        "UPDATE rounds SET end_price = %s, result = %s WHERE id = %s",
-                        (end_price, result, round_data["id"])
-                    )
-                    conn.commit()
-
-                    print(f"  [RESOLVE] {symbol} Round #{round_data['id']}: {round_data['start_price']} -> {end_price} = {result.upper()}")
-                    resolve_round(round_data["id"], result)
-                    return symbol
-            except Exception as e:
-                print(f"  [ERROR] Error resolving {symbol}: {e}")
-                return None
-
-        # Resolve all rounds in parallel using ThreadPoolExecutor
-        resolved_count = 0
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(resolve_single_symbol, symbol): symbol for symbol in CRYPTO_MAP.keys()}
-            for future in as_completed(futures):
-                if future.result() is not None:
-                    resolved_count += 1
-
-        print(f"[SUCCESS] Resolved {resolved_count} rounds in parallel. Pausing exactly {pause_duration}s before next round starts instantly...")
-        time.sleep(pause_duration)
-        print(f"[ROUNDS] Starting new round immediately after pause!")
+            print(f"[SUCCESS] Resolved {resolved_count} rounds in parallel. Pausing exactly {pause_duration}s before next round starts instantly...")
+            time.sleep(pause_duration)
+            print(f"[ROUNDS] Starting new round immediately after pause!")
+            
+        except Exception as e:
+            print(f"[CRITICAL] Error in rounds loop: {e}")
+            time.sleep(60)  # Wait before retrying
 
 
 
