@@ -584,9 +584,15 @@ def place_bet():
     if not round_id:
         return jsonify({"error": "Round ID is required"}), 400
 
+    # Validate symbol - allow both crypto and stock symbols
     is_valid, result = validate_crypto_symbol(crypto)
+    is_stock = False
     if not is_valid:
-        return jsonify({"error": result}), 400
+        # Try stock symbol validation
+        is_valid, result = validate_stock_symbol(crypto)
+        if not is_valid:
+            return jsonify({"error": "Invalid symbol"}), 400
+        is_stock = True
     crypto = result
 
     is_valid, result = validate_direction(direction)
@@ -600,6 +606,26 @@ def place_bet():
     amount = result
 
     with get_db_cursor() as (cursor, conn):
+        # Check if round exists and betting window is open
+        cursor.execute(
+            "SELECT id, end_time FROM rounds WHERE id = %s AND result IS NULL",
+            (round_id,)
+        )
+        round_data = cursor.fetchone()
+        
+        if not round_data:
+            return jsonify({"error": "Round not found or already ended"}), 404
+        
+        # Check if betting window is still open
+        # Crypto: 3 minutes before end, Stocks: 6 hours before end
+        now = int(time.time())
+        time_left = round_data['end_time'] - now
+        
+        cutoff_time = 21600 if is_stock else 180  # 6 hours for stocks, 3 minutes for crypto
+        
+        if time_left < cutoff_time:
+            return jsonify({"error": "Betting window closed"}), 400
+        
         cursor.execute(
             "SELECT id FROM bets WHERE user_id = %s AND round_id = %s",
             (user_id, round_id)
@@ -993,6 +1019,23 @@ def place_onchain_bet():
         return jsonify({"error": "Invalid request"}), 400
 
     with get_db_cursor() as (cursor, conn):
+        # Check if round exists and betting window is open
+        cursor.execute(
+            "SELECT id, end_time FROM onchain_rounds WHERE id = %s AND result IS NULL",
+            (round_id,)
+        )
+        round_data = cursor.fetchone()
+        
+        if not round_data:
+            return jsonify({"error": "Round not found or already ended"}), 404
+        
+        # Check if betting window is still open (must be >6 hours remaining for on-chain)
+        now = int(time.time())
+        time_left = round_data['end_time'] - now
+        
+        if time_left < 21600:  # 6 hours
+            return jsonify({"error": "Betting window closed"}), 400
+        
         # Check if bet already placed
         cursor.execute(
             "SELECT id FROM onchain_bets WHERE user_id = %s AND round_id = %s",
