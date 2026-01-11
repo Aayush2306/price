@@ -433,7 +433,7 @@ def phantom_verify():
     if not nonce or session_wallet != wallet_address:
         return jsonify({"error": "No active login session"}), 400
 
-    message = f"PredictGram login\nWallet: {wallet_address}\nNonce: {nonce}"
+    message = f"On-Chain Market login\nWallet: {wallet_address}\nNonce: {nonce}"
     try:
         signature = base64.b64decode(signature_b64)
         pubkey_bytes = base58.b58decode(wallet_address)
