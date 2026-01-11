@@ -413,7 +413,7 @@ def phantom_nonce():
     session["phantom_nonce"] = nonce
     session["phantom_wallet"] = wallet_address
 
-    message = f"PredictGram login\nWallet: {wallet_address}\nNonce: {nonce}"
+    message = f"On-Chain Market login\nWallet: {wallet_address}\nNonce: {nonce}"
     return jsonify({"message": message})
 
 
