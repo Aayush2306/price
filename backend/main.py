@@ -57,7 +57,7 @@ def send_webhook(event_type, payload):
     url = WEBHOOK_URLS.get(event_type, "")
     if not url:
         return  # No webhook configured for this event
-    
+
     try:
         headers = {
             "Content-Type": "application/json",
@@ -75,7 +75,7 @@ def send_webhook(event_type, payload):
                 hashlib.sha256
             ).hexdigest()
             headers["X-Webhook-Signature"] = signature
-        
+
         response = requests.post(url, json=payload, headers=headers, timeout=5)
         print(f"[WEBHOOK] {event_type}: sent to {url[:30]}... - Status: {response.status_code}")
     except Exception as e:
@@ -548,16 +548,16 @@ def phantom_nonce():
         return jsonify({"error": "Missing wallet_address"}), 400
 
     nonce = uuid.uuid4().hex
-    
+
     # Clear any existing session data first to prevent stale data
     session.clear()
-    
+
     # Make session permanent with longer lifetime for nonce phase
     session.permanent = True
     session["phantom_nonce"] = nonce
     session["phantom_wallet"] = wallet_address
     session["nonce_created_at"] = int(time.time())
-    
+
     # Force session to be saved
     session.modified = True
 
@@ -581,17 +581,17 @@ def phantom_verify():
     if not wallet_address or not signature_b64:
         print(f"[AUTH] Verify failed: Missing wallet_address or signature")
         return jsonify({"error": "Missing wallet_address or signature"}), 400
-    
+
     # Check if nonce expired (5 minute timeout)
     if nonce_created_at and (int(time.time()) - nonce_created_at) > 300:
         print(f"[AUTH] Verify failed: Nonce expired for wallet {wallet_address[:8]}...{wallet_address[-4:]}")
         session.clear()
         return jsonify({"error": "Login session expired. Please try again."}), 400
-    
+
     if not nonce:
         print(f"[AUTH] Verify failed: No nonce in session for wallet {wallet_address[:8]}...{wallet_address[-4:]}. Session keys: {list(session.keys())}")
         return jsonify({"error": "No active login session. Please reconnect your wallet."}), 400
-    
+
     if session_wallet != wallet_address:
         print(f"[AUTH] Verify failed: Wallet mismatch. Session: {session_wallet}, Request: {wallet_address}")
         return jsonify({"error": "Wallet address mismatch. Please reconnect your wallet."}), 400
@@ -711,20 +711,20 @@ def place_bet():
             (round_id,)
         )
         round_data = cursor.fetchone()
-        
+
         if not round_data:
             return jsonify({"error": "Round not found or already ended"}), 404
-        
+
         # Check if betting window is still open
         # Crypto: 3 minutes before end, Stocks: 6 hours before end
         now = int(time.time())
         time_left = round_data['end_time'] - now
-        
+
         cutoff_time = 21600 if is_stock else 180  # 6 hours for stocks, 3 minutes for crypto
-        
+
         if time_left < cutoff_time:
             return jsonify({"error": "Betting window closed"}), 400
-        
+
         cursor.execute(
             "SELECT id FROM bets WHERE user_id = %s AND round_id = %s",
             (user_id, round_id)
@@ -788,7 +788,7 @@ def logout():
 def get_live_bets():
     round_id = request.args.get("round_id")
     crypto = request.args.get("crypto")
-    
+
     if not round_id or not crypto:
         return jsonify({"error": "Missing round_id or crypto"}), 400
 
@@ -1025,8 +1025,9 @@ def get_notifications():
                 ob.status,
                 ob.profit,
                 ob.created_at,
-                NULL as start_price,
-                NULL as end_price,
+                obr.start_value as start_price,
+                obr.end_value as end_price,
+                obr.reference_value,
                 obr.result,
                 obr.start_time,
                 obr.end_time,
@@ -1126,17 +1127,17 @@ def place_onchain_bet():
             (round_id,)
         )
         round_data = cursor.fetchone()
-        
+
         if not round_data:
             return jsonify({"error": "Round not found or already ended"}), 404
-        
+
         # Check if betting window is still open (must be >6 hours remaining for on-chain)
         now = int(time.time())
         time_left = round_data['end_time'] - now
-        
+
         if time_left < 21600:  # 6 hours
             return jsonify({"error": "Betting window closed"}), 400
-        
+
         # Check if bet already placed
         cursor.execute(
             "SELECT id FROM onchain_bets WHERE user_id = %s AND round_id = %s",
@@ -1192,6 +1193,7 @@ def get_user_onchain_bets():
         bets = cursor.fetchall()
 
     return jsonify(bets)
+
 # ===== CUSTOM BET ENDPOINTS =====
 
 @app.route("/api/custom-bet/create", methods=["POST"])
@@ -1378,7 +1380,7 @@ def place_custom_bet():
         )
 
         conn.commit()
-        
+
         # Get updated pool totals for socket emit
         cursor.execute(
             """
@@ -1393,7 +1395,7 @@ def place_custom_bet():
             """, (round_id,)
         )
         pool_data = cursor.fetchone()
-        
+
         # Emit custom bet update to room
         room = f"custom-bet-{round_id}"
         socketio.emit("custom_bet_update", {
@@ -1407,7 +1409,7 @@ def place_custom_bet():
                 "amount": amount
             }
         }, room=room)
-        
+
         # Also emit credits update to user
         socketio.emit("credits_update", {
             "user_id": user_id,
@@ -1743,7 +1745,7 @@ def resolve_round(round_id, result):
         # Commit all database changes
         conn.commit()
         print(f"  [BETS] Resolved {len(all_bets)} bets for round #{round_id}")
-        
+
         # Send webhook for round resolution
         send_webhook("round_resolved", {
             "event": "round_resolved",
@@ -1804,7 +1806,7 @@ def run_rounds_forever():
                 print(f"[ERROR] Failed to get prices at round start! Retrying in 30s...")
                 time.sleep(30)
                 continue
-                
+
             round_start = int(time.time())
             round_end = round_start + round_duration
 
@@ -1889,7 +1891,7 @@ def run_rounds_forever():
             print(f"[SUCCESS] Resolved {resolved_count} rounds in parallel. Pausing exactly {pause_duration}s before next round starts instantly...")
             time.sleep(pause_duration)
             print(f"[ROUNDS] Starting new round immediately after pause!")
-            
+
         except Exception as e:
             print(f"[CRITICAL] Error in rounds loop: {e}")
             time.sleep(60)  # Wait before retrying
@@ -2035,7 +2037,7 @@ def resolve_onchain_bets(round_id, result):
 
         conn.commit()
         print(f"[ONCHAIN] Resolved {len(all_bets)} bets for round #{round_id}")
-        
+
         # Send webhook for on-chain round resolution
         cursor.execute("SELECT category FROM onchain_rounds WHERE id = %s", (round_id,))
         round_info = cursor.fetchone()
@@ -2258,7 +2260,7 @@ def resolve_custom_bet_round(round_id):
                     print(f"[CUSTOM BET] Resolved: {len(winners)} winners, {len(losers)} losers, Creator fee: {creator_fee}")
 
             conn.commit()
-            
+
             # Calculate winners/losers counts for socket emit
             if result == "same":
                 winners_count = 0
@@ -2266,7 +2268,7 @@ def resolve_custom_bet_round(round_id):
             else:
                 winners_count = len(winners)
                 losers_count = len(losers)
-            
+
             # Emit custom_bet_resolved socket event
             room = f"custom-bet-{round_id}"
             socketio.emit("custom_bet_resolved", {
@@ -2280,7 +2282,7 @@ def resolve_custom_bet_round(round_id):
                 "winners_count": winners_count,
                 "losers_count": losers_count
             }, room=room)
-            
+
             # Also emit bet_result to each user who placed a bet
             for bet in all_bets:
                 status = "refunded" if result == "same" else ("won" if bet['prediction'] == result else "lost")
@@ -2292,7 +2294,7 @@ def resolve_custom_bet_round(round_id):
                     "amount": bet['amount'],
                     "profit": bet.get('profit', 0)
                 }, room=f"user-{bet['user_id']}")
-            
+
             # Send webhook for custom bet resolution
             send_webhook("custom_bet_resolved", {
                 "event": "custom_bet_resolved",
@@ -2423,4 +2425,3 @@ startup()
 if __name__ == "__main__":
     debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
     socketio.run(app, host="0.0.0.0", port=8080, debug=debug_mode)
-
