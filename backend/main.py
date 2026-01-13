@@ -1181,9 +1181,9 @@ def get_user_onchain_bets():
     with get_db_cursor() as (cursor, _):
         cursor.execute(
             """
-            SELECT ob.*, or.start_value, or.end_value, or.reference_value, or.result
+            SELECT ob.*, ocr.start_value, ocr.end_value, ocr.reference_value, ocr.result
             FROM onchain_bets ob
-            JOIN onchain_rounds or ON ob.round_id = or.id
+            JOIN onchain_rounds ocr ON ob.round_id = ocr.id
             WHERE ob.user_id = %s
             ORDER BY ob.created_at DESC
             LIMIT 20
@@ -1192,7 +1192,6 @@ def get_user_onchain_bets():
         bets = cursor.fetchall()
 
     return jsonify(bets)
-
 # ===== CUSTOM BET ENDPOINTS =====
 
 @app.route("/api/custom-bet/create", methods=["POST"])
