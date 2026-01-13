@@ -876,9 +876,11 @@ def leaderboard():
 def recent_wins():
     with get_db_cursor() as (cursor, _):
         cursor.execute('''
-            SELECT bets.*, rounds.start_price, rounds.end_price 
+            SELECT bets.*, rounds.start_price, rounds.end_price,
+                   users.name, users.username
             FROM bets 
             JOIN rounds ON bets.round_id = rounds.id 
+            LEFT JOIN users ON bets.user_id = users.id
             WHERE bets.status = 'won' 
             ORDER BY bets.id DESC 
             LIMIT 5
