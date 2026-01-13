@@ -1,5 +1,6 @@
 import eventlet
-eventlet.monkey_patch()
+# Patch with thread=False to avoid threading issues
+eventlet.monkey_patch(thread=False)
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import uuid
@@ -84,7 +85,16 @@ app = Flask(__name__)
 
 # CORS configuration - use environment variable for production
 ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*').split(',')
-socketio = SocketIO(app, cors_allowed_origins=ALLOWED_ORIGINS,cors_credentials=True)
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=ALLOWED_ORIGINS,
+    cors_credentials=True,
+    async_mode='eventlet',
+    logger=False,  # Disable verbose logging
+    engineio_logger=False,  # Disable engine.io logging
+    ping_timeout=60,  # Increase ping timeout
+    ping_interval=25  # Increase ping interval
+)
 
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 redis_url = os.environ.get('REDIS_URL')
@@ -146,45 +156,101 @@ CG_API_KEY = os.environ['CG_API_KEY']
 
 
 # DB Pool with connection health check
+# Optimized for Railway app → Replit PostgreSQL Pro (100+ connections supported)
+# Network latency considered for cross-platform setup
 pool = ThreadedConnectionPool(
-    1,
-    20,  # Reduced for Railway limits
+    3,  # Min connections (reduced to avoid idle connections)
+    40,  # Max connections (reduced from 50 to be conservative with Replit)
     os.environ['DATABASE_URL'],
-    cursor_factory=psycopg2.extras.RealDictCursor
+    cursor_factory=psycopg2.extras.RealDictCursor,
+    connect_timeout=15,  # 15 second timeout (increased for Railway→Replit latency)
+    options='-c statement_timeout=30000 -c idle_in_transaction_session_timeout=60000',  # 30s query, 60s idle timeout
+    keepalives=1,  # Enable TCP keepalives
+    keepalives_idle=30,  # Send keepalive after 30s of inactivity
+    keepalives_interval=10,  # Retry every 10s
+    keepalives_count=5  # Max 5 retries before disconnect
 )
 
 @contextmanager
 def get_db_cursor(real_dict=False):
     conn = None
-    try:
-        conn = pool.getconn()
-        # Test connection health before using
+    cursor = None
+    max_retries = 3
+    retry_count = 0
+
+    while retry_count < max_retries:
         try:
-            conn.isolation_level
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            # Connection is dead, close it and get a new one
-            try:
-                pool.putconn(conn, close=True)
-            except:
-                pass
+            # Try to get connection with timeout
             conn = pool.getconn()
-        
-        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor if real_dict else None)
-        yield cursor, conn
-        conn.commit()
-    except Exception as e:
-        if conn:
+
+            # Test connection health before using (critical for Railway→Replit latency)
             try:
-                conn.rollback()
-            except:
-                pass
-        raise e
-    finally:
-        if conn:
-            try:
-                pool.putconn(conn)
-            except:
-                pass
+                conn.isolation_level
+                # Ping the database to ensure connection is truly alive
+                with conn.cursor() as test_cursor:
+                    test_cursor.execute("SELECT 1")
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                # Connection is dead, close it and get a new one
+                print(f"[DB] Stale connection detected, getting fresh connection: {e}")
+                try:
+                    pool.putconn(conn, close=True)
+                except:
+                    pass
+                conn = pool.getconn()
+
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor if real_dict else None)
+            yield cursor, conn
+            conn.commit()
+            break  # Success, exit retry loop
+
+        except psycopg2.pool.PoolError as e:
+            # Pool exhausted - wait and retry
+            retry_count += 1
+            if retry_count < max_retries:
+                print(f"[DB] Pool exhausted ({retry_count}/{max_retries}), waiting before retry...")
+                time.sleep(0.5 * retry_count)  # Exponential backoff
+                continue
+            else:
+                print(f"[DB] Pool exhausted after {max_retries} retries")
+                raise e
+
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # Network or connection error - retry
+            retry_count += 1
+            if conn:
+                try:
+                    pool.putconn(conn, close=True)
+                    conn = None
+                except:
+                    pass
+
+            if retry_count < max_retries:
+                print(f"[DB] Connection error, retry {retry_count}/{max_retries}: {e}")
+                time.sleep(1 * retry_count)
+                continue
+            else:
+                raise e
+
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except:
+                    pass
+            raise e
+
+        finally:
+            # Always close cursor and return connection to pool
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+            if conn:
+                try:
+                    pool.putconn(conn)
+                except Exception as e:
+                    print(f"[DB] Error returning connection to pool: {e}")
 
 
 
@@ -198,6 +264,19 @@ def release_conn(conn):
 
 def release_db_connection(conn):
     pool.putconn(conn)
+
+
+def get_pool_status():
+    """Get current connection pool status for debugging"""
+    try:
+        # Access protected members for debugging
+        return {
+            "minconn": pool.minconn,
+            "maxconn": pool.maxconn,
+            "closed": pool.closed
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def ensure_user_schema():
@@ -1797,8 +1876,10 @@ def run_rounds_forever():
                     return None
 
             # Resolve all rounds in parallel using ThreadPoolExecutor
+            # Reduced max_workers to 5 for Railway→Replit cross-platform setup
+            # Each worker needs 1-2 DB connections, so 5 workers = ~10 connections max
             resolved_count = 0
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = {executor.submit(resolve_single_symbol, symbol): symbol for symbol in CRYPTO_MAP.keys()}
                 for future in as_completed(futures):
                     if future.result() is not None:
